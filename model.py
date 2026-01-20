@@ -76,6 +76,7 @@ class DBDataset(Dataset):
         # Convert to tensors
         plm_t = torch.from_numpy(plm).float()      # (L, 1024)
         di_t = torch.from_numpy(di).long()         # (L,)
+        di_t = torch.where(di_t == -1, 20, di_t)   # Replace unknown (-1) with pad token (20)
         conf_t = torch.from_numpy(conf).float()    # (L,)
 
         return {
