@@ -274,19 +274,34 @@ def main():
     # ------------------ Datasets & loaders ------------------
     print("Loading datasets...")
 
-    train_ds = DBDataset(args.train_tsv, args.features_dir)
+    # Collect all classes from train, val, test TSVs
+    import csv
+    all_classes = set()
+    for tsv_path in [args.train_tsv, args.val_tsv, args.test_tsv]:
+        with open(tsv_path, "r") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                all_classes.add(row["class"])
+    
+    classes = sorted(all_classes)
+    # Optional: force non_ARG to index 0 if present
+    if "non_ARG" in classes:
+        classes = ["non_ARG"] + [c for c in classes if c != "non_ARG"]
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+
+    train_ds = DBDataset(args.train_tsv, args.features_dir, class_to_idx=class_to_idx)
     val_ds = DBDataset(
         args.val_tsv,
         args.features_dir,
-        class_to_idx=train_ds.class_to_idx,
+        class_to_idx=class_to_idx,
     )
     test_ds = DBDataset(
         args.test_tsv,
         args.features_dir,
-        class_to_idx=train_ds.class_to_idx,
+        class_to_idx=class_to_idx,
     )
 
-    n_classes = len(train_ds.class_to_idx)
+    n_classes = len(class_to_idx)
     print(f"n_classes = {n_classes}")
     print(f"Train samples: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
 
@@ -347,7 +362,6 @@ def main():
         mode="max",      # we want to maximize AUROC
         factor=0.5,      # halve LR
         patience=3,      # after 3 epochs with no AUROC improvement
-        verbose=True,
     )
 
     best_val_auc = -1.0
@@ -386,6 +400,10 @@ def main():
         # Step scheduler with validation AUROC
         scheduler.step(val_metrics["auc_roc"])
 
+        # Print current LR
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"  LR={current_lr}")
+
         print(
             f"  Val:   "
             f"loss={val_metrics['loss_total']:.4f} "
@@ -410,7 +428,7 @@ def main():
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_metrics": val_metrics,
-                    "class_to_idx": train_ds.class_to_idx,
+                    "class_to_idx": class_to_idx,
                     "args": vars(args),
                 },
                 best_ckpt_path,

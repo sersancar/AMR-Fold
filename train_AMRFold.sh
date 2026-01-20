@@ -9,8 +9,8 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=200G
-#SBATCH --time=02:00:00
+#SBATCH --mem=16G
+#SBATCH --time=3:00:00
 #SBATCH --mail-type=FAIL
 #SBATCH --mail-user=sergio.sanchezcarrillo@universityofgalway.ie
 
@@ -20,7 +20,11 @@ set -euo pipefail
 source /project/home/p201140/Miniforge3/etc/profile.d/conda.sh
 conda activate /mnt/tier2/project/p201140/Miniforge3/envs/amrfold-cuda
 
+# CUDA
+CUDA_LAUNCH_BLOCKING=1
+export CUDA_LAUNCH_BLOCKING
 
+# Logging
 echo "Job started on $(date)"
 echo "Running on node(s): $SLURM_NODELIST"
 echo "Current working directory: $(pwd)"
@@ -41,7 +45,7 @@ DB_VAL=${DATADIR}/DB_val.tsv
 DB_TEST=${DATADIR}/DB_test.tsv
 MAX_LEN=1024
 BATCH_SIZE=32
-EPOCHS=1
+EPOCHS=40
 
 # Export so they are visible inside Python
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
