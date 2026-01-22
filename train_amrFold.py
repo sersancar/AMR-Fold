@@ -16,7 +16,7 @@ from sklearn.metrics import (
     f1_score,
 )
 
-from model import DBDataset, arg_collate_fn, AMRFoldModel
+from model import DBDataset, DBDatasetLMDB, arg_collate_fn, AMRFoldModel
 
 
 # -------------------------
@@ -50,12 +50,12 @@ def evaluate(
 
     with torch.no_grad():
         for batch in data_loader:
-            plm = batch["plm"].to(device)
-            di = batch["di"].to(device)
-            conf = batch["conf"].to(device)
-            attn_mask = batch["attention_mask"].to(device)
-            bin_labels = batch["bin_labels"].to(device)
-            class_labels = batch["class_labels"].to(device)
+            plm = batch["plm"].to(device, non_blocking=True)
+            di = batch["di"].to(device, non_blocking=True)
+            conf = batch["conf"].to(device, non_blocking=True)
+            attn_mask = batch["attention_mask"].to(device, non_blocking=True)
+            bin_labels = batch["bin_labels"].to(device, non_blocking=True)
+            class_labels = batch["class_labels"].to(device, non_blocking=True)
 
             out = model(plm, di, conf, attn_mask, return_attn=False)
             logits_bin = out["logits_bin"]         # (B,)
@@ -150,12 +150,12 @@ def train_one_epoch(
     eps = 1e-8
 
     for batch in data_loader:
-        plm = batch["plm"].to(device)
-        di = batch["di"].to(device)
-        conf = batch["conf"].to(device)
-        attn_mask = batch["attention_mask"].to(device)
-        bin_labels = batch["bin_labels"].to(device)
-        class_labels = batch["class_labels"].to(device)
+        plm = batch["plm"].to(device, non_blocking=True)
+        di = batch["di"].to(device, non_blocking=True)
+        conf = batch["conf"].to(device, non_blocking=True)
+        attn_mask = batch["attention_mask"].to(device, non_blocking=True)
+        bin_labels = batch["bin_labels"].to(device, non_blocking=True)
+        class_labels = batch["class_labels"].to(device, non_blocking=True)
 
         optimizer.zero_grad()
 
@@ -224,16 +224,25 @@ def parse_args():
     p.add_argument("--train_tsv", required=True, help="Path to DB_train.tsv")
     p.add_argument("--val_tsv", required=True, help="Path to DB_val.tsv")
     p.add_argument("--test_tsv", required=True, help="Path to DB_test.tsv")
-    p.add_argument(
-        "--features_dir",
-        required=True,
-        help="Directory with *.plm.npy, *.3di.npy, *.conf.npy",
-    )
+
     p.add_argument(
         "--out_dir",
         required=True,
         help="Output directory for checkpoints and logs",
     )
+
+    p.add_argument(
+        "--features_dir", 
+        default=None,
+        help="Directory with *.plm.npy, *.3di.npy, *.conf.npy",
+    )
+
+    p.add_argument(
+        "--features_lmdb",
+        default=None,
+        help="Path to LMDB directory (contains data.mdb/lock.mdb)")
+
+  
 
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--epochs", type=int, default=40)
@@ -265,6 +274,10 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # Validate features input: exactly one of dir or lmdb
+    if (args.features_dir is None) == (args.features_lmdb is None):
+        raise ValueError("Provide exactly one of --features_dir or --features_lmdb")
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -284,22 +297,20 @@ def main():
                 all_classes.add(row["class"])
     
     classes = sorted(all_classes)
-    # Optional: force non_ARG to index 0 if present
+    # Force non_ARG to index 0 if present
     if "non_ARG" in classes:
         classes = ["non_ARG"] + [c for c in classes if c != "non_ARG"]
     class_to_idx = {c: i for i, c in enumerate(classes)}
 
-    train_ds = DBDataset(args.train_tsv, args.features_dir, class_to_idx=class_to_idx)
-    val_ds = DBDataset(
-        args.val_tsv,
-        args.features_dir,
-        class_to_idx=class_to_idx,
-    )
-    test_ds = DBDataset(
-        args.test_tsv,
-        args.features_dir,
-        class_to_idx=class_to_idx,
-    )
+    if args.features_lmdb:
+        train_ds = DBDatasetLMDB(args.train_tsv, args.features_lmdb, class_to_idx=class_to_idx)
+        val_ds   = DBDatasetLMDB(args.val_tsv,   args.features_lmdb, class_to_idx=class_to_idx)
+        test_ds  = DBDatasetLMDB(args.test_tsv,  args.features_lmdb, class_to_idx=class_to_idx)
+    else:
+        train_ds = DBDataset(args.train_tsv, args.features_dir, class_to_idx=class_to_idx)
+        val_ds   = DBDataset(args.val_tsv,   args.features_dir, class_to_idx=class_to_idx)
+        test_ds  = DBDataset(args.test_tsv,  args.features_dir, class_to_idx=class_to_idx)
+
 
     n_classes = len(class_to_idx)
     print(f"n_classes = {n_classes}")
@@ -314,6 +325,8 @@ def main():
         num_workers=args.num_workers,
         collate_fn=collate,
         pin_memory=True,
+	    persistent_workers=True,
+    	prefetch_factor=2,
     )
 
     val_loader = DataLoader(
@@ -323,6 +336,8 @@ def main():
         num_workers=args.num_workers,
         collate_fn=collate,
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     test_loader = DataLoader(
@@ -332,6 +347,8 @@ def main():
         num_workers=args.num_workers,
         collate_fn=collate,
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     # ------------------ Model, optimizer ------------------

@@ -2,6 +2,8 @@
 
 import os
 import csv
+import lmdb
+import pickle
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import torch
@@ -78,6 +80,76 @@ class DBDataset(Dataset):
         di_t = torch.from_numpy(di).long()         # (L,)
         di_t = torch.where(di_t == -1, 20, di_t)   # Replace unknown (-1) with pad token (20)
         conf_t = torch.from_numpy(conf).float()    # (L,)
+
+        return {
+            "seq_id": seq_id,
+            "plm": plm_t,
+            "di": di_t,
+            "conf": conf_t,
+            "bin": torch.tensor(bin_label, dtype=torch.float32),
+            "class": torch.tensor(class_label, dtype=torch.long),
+        }
+
+class DBDatasetLMDB(Dataset):
+    def __init__(self, tsv_path: str, lmdb_dir: str, class_to_idx=None):
+        self.tsv_path = tsv_path
+        self.lmdb_dir = lmdb_dir
+
+        # Read TSV (same as your current class)
+        self.records = []
+        with open(tsv_path, "r") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                self.records.append(row)
+
+        # class_to_idx logic identical to your current implementation
+        if class_to_idx is None:
+            classes = sorted({r["class"] for r in self.records})
+            if "non_ARG" in classes:
+                classes = ["non_ARG"] + [c for c in classes if c != "non_ARG"]
+            self.class_to_idx = {c: i for i, c in enumerate(classes)}
+        else:
+            self.class_to_idx = class_to_idx
+
+        self.idx_to_class = {i: c for c, i in self.class_to_idx.items()}
+
+        # Important: open LMDB lazily per worker process
+        self._env = None
+
+    def _get_env(self):
+        if self._env is None:
+            self._env = lmdb.open(
+                self.lmdb_dir,
+                subdir=True,
+                readonly=True,
+                lock=False,
+                readahead=True,
+                meminit=False,
+                max_readers=2048,
+            )
+        return self._env
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        rec = self.records[idx]
+        seq_id = rec["Ids"]
+
+        bin_label = int(rec["bin"])
+        class_label = self.class_to_idx[rec["class"]]
+
+        env = self._get_env()
+        with env.begin(write=False) as txn:
+            blob = txn.get(seq_id.encode("utf-8"))
+            if blob is None:
+                raise KeyError(f"Missing seq_id in LMDB: {seq_id}")
+            plm, di, conf = pickle.loads(blob)
+
+        plm_t = torch.from_numpy(plm).float()
+        di_t = torch.from_numpy(di).long()
+        di_t = torch.where(di_t == -1, 20, di_t)
+        conf_t = torch.from_numpy(conf).float()
 
         return {
             "seq_id": seq_id,
