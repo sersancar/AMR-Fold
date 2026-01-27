@@ -723,7 +723,12 @@ def _release_dir_lock(lock_dir: str) -> None:
 def create_study_safe(args: argparse.Namespace, pruner, sampler):
     storage_obj: Any = args.storage
 
-    lock_dir = os.path.join(args.out_dir, f".optuna_init_lock_{args.study_name}")
+    lock_base = args.out_dir
+    if isinstance(args.storage, str) and args.storage.startswith("sqlite"):
+        p = _sqlite_path_from_url(args.storage)
+        if p:
+            lock_base = os.path.dirname(p)
+    lock_dir = os.path.join(lock_base, f".optuna_init_lock_{args.study_name}")
     _acquire_dir_lock(lock_dir)
     try:
         if isinstance(args.storage, str) and args.storage.startswith("sqlite"):
@@ -1165,6 +1170,12 @@ def parse_args() -> argparse.Namespace:
 
 
     # Logging / verbosity
+    p.add_argument(
+        '--optuna_verbosity',
+        choices=['debug','info','warning','error','critical'],
+        default='info',
+        help='Optuna internal logging level'
+    )
     # By default, keep console output minimal (Optuna logs only). Enable these flags if needed.
     p.add_argument('--print_trial_header', action='store_true', help='Print trial hyperparameters at the start of each trial')
     p.add_argument('--print_epoch_summary', action='store_true', help='Print per-epoch train/val summaries inside each trial')
@@ -1173,8 +1184,21 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _set_optuna_verbosity(level: str) -> None:
+    mapping = {
+        'debug': optuna.logging.DEBUG,
+        'info': optuna.logging.INFO,
+        'warning': optuna.logging.WARNING,
+        'error': optuna.logging.ERROR,
+        'critical': optuna.logging.CRITICAL,
+    }
+    optuna.logging.set_verbosity(mapping.get(level, optuna.logging.INFO))
+
+
 def main() -> None:
     args = parse_args()
+    _set_optuna_verbosity(getattr(args, 'optuna_verbosity', 'info'))
+    _set_optuna_verbosity(getattr(args, 'optuna_verbosity', 'info'))
     set_seed(args.seed)
     ensure_dir(args.out_dir)
 
