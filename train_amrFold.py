@@ -2,7 +2,7 @@
 
 import argparse
 import os
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -14,6 +14,7 @@ from sklearn.metrics import (
     average_precision_score,
     accuracy_score,
     f1_score,
+    precision_recall_curve,
 )
 
 from model import DBDataset, DBDatasetLMDB, arg_collate_fn, AMRFoldModel
@@ -23,30 +24,61 @@ from model import DBDataset, DBDatasetLMDB, arg_collate_fn, AMRFoldModel
 # Evaluation
 # -------------------------
 
+def _best_f1_threshold(labels: np.ndarray, probs: np.ndarray):
+    """Return (best_thr, best_f1). Uses PR curve; robust to edge cases."""
+    # precision_recall_curve returns precision/recall for thresholds in ascending order
+    prec, rec, thr = precision_recall_curve(labels, probs)
+    f1 = (2.0 * prec * rec) / (prec + rec + 1e-12)
+
+    best_i = int(np.nanargmax(f1))
+    # thr has length len(prec)-1; last prec/rec point corresponds to thr=1.0 (no threshold)
+    if best_i >= len(thr):
+        best_thr = 0.5
+    else:
+        best_thr = float(thr[best_i])
+
+    return best_thr, float(f1[best_i])
+
+
 def evaluate(
     model: nn.Module,
     data_loader: DataLoader,
     device: torch.device,
+    *,
     lambda_class: float = 0.5,
+    threshold: float = 0.5,
+    tune_threshold: bool = False,
+    criterion_bin: Optional[nn.Module] = None,
+    criterion_class: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """
     Run evaluation on a loader: compute losses + metrics (no attention regularisation).
+
+    Notes:
+      - Class loss is computed ONLY on positives (bin==1), to match training (Option A1).
+      - If tune_threshold=True, selects a threshold on this split that maximizes F1_bin.
+        (Use this on VAL only, then reuse the resulting threshold on TEST.)
     """
     model.eval()
 
-    criterion_bin = nn.BCEWithLogitsLoss(reduction="sum")
-    criterion_class = nn.CrossEntropyLoss(reduction="sum")
+    # Default criteria (unweighted) if not provided
+    if criterion_bin is None:
+        criterion_bin = nn.BCEWithLogitsLoss(reduction="sum")
+    if criterion_class is None:
+        criterion_class = nn.CrossEntropyLoss(reduction="sum")
 
     total_bin_loss = 0.0
     total_class_loss = 0.0
     total_samples = 0
+    total_pos = 0
 
     all_bin_labels = []
     all_bin_probs = []
-    all_bin_preds = []
 
     all_class_labels = []
     all_class_preds = []
+    all_class_labels_pos = []
+    all_class_preds_pos = []
 
     with torch.no_grad():
         for batch in data_loader:
@@ -64,18 +96,26 @@ def evaluate(
             B = bin_labels.size(0)
             total_samples += B
 
+            # Binary loss across all samples
             bin_loss = criterion_bin(logits_bin, bin_labels)
-            class_loss = criterion_class(logits_class, class_labels)
+            total_bin_loss += float(bin_loss.item())
 
-            total_bin_loss += bin_loss.item()
-            total_class_loss += class_loss.item()
+            # Class loss on positives only (Option A1)
+            pos_mask = (bin_labels > 0.5)
+            if pos_mask.any():
+                class_loss = criterion_class(logits_class[pos_mask], class_labels[pos_mask])
+                total_class_loss += float(class_loss.item())
+                total_pos += int(pos_mask.sum().item())
 
+                preds_class_pos = logits_class[pos_mask].argmax(dim=1)
+                all_class_labels_pos.append(class_labels[pos_mask].cpu().numpy())
+                all_class_preds_pos.append(preds_class_pos.cpu().numpy())
+
+            # Probabilities for metrics
             probs_bin = torch.sigmoid(logits_bin)
-            preds_bin = (probs_bin >= 0.5).long()
 
             all_bin_labels.append(bin_labels.cpu().numpy())
             all_bin_probs.append(probs_bin.cpu().numpy())
-            all_bin_preds.append(preds_bin.cpu().numpy())
 
             preds_class = logits_class.argmax(dim=1)
             all_class_labels.append(class_labels.cpu().numpy())
@@ -83,15 +123,24 @@ def evaluate(
 
     all_bin_labels = np.concatenate(all_bin_labels, axis=0)
     all_bin_probs = np.concatenate(all_bin_probs, axis=0)
-    all_bin_preds = np.concatenate(all_bin_preds, axis=0)
 
     all_class_labels = np.concatenate(all_class_labels, axis=0)
     all_class_preds = np.concatenate(all_class_preds, axis=0)
 
-    avg_bin_loss = total_bin_loss / total_samples
-    avg_class_loss = total_class_loss / total_samples
-    avg_total_loss = avg_bin_loss + lambda_class * avg_class_loss
+    if len(all_class_labels_pos) > 0:
+        all_class_labels_pos = np.concatenate(all_class_labels_pos, axis=0)
+        all_class_preds_pos = np.concatenate(all_class_preds_pos, axis=0)
+    else:
+        all_class_labels_pos = np.array([], dtype=np.int64)
+        all_class_preds_pos = np.array([], dtype=np.int64)
 
+    # Losses
+    avg_bin_loss = total_bin_loss / max(total_samples, 1)
+    # class loss averaged over positives (not total samples)
+    avg_class_loss = (total_class_loss / total_pos) if total_pos > 0 else float("nan")
+    avg_total_loss = avg_bin_loss + lambda_class * (avg_class_loss if total_pos > 0 else 0.0)
+
+    # Ranking metrics
     try:
         auc_roc = roc_auc_score(all_bin_labels, all_bin_probs)
     except ValueError:
@@ -102,22 +151,55 @@ def evaluate(
     except ValueError:
         auc_pr = float("nan")
 
+    # Threshold selection / application
+    best_thr = float("nan")
+    f1_bin_best = float("nan")
+    if tune_threshold:
+        best_thr, f1_bin_best = _best_f1_threshold(all_bin_labels, all_bin_probs)
+        thr_to_use = best_thr
+    else:
+        thr_to_use = float(threshold)
+
+    # Always compute metrics at the default 0.5 threshold for diagnostics
+    all_bin_preds_0p5 = (all_bin_probs >= 0.5).astype(np.int64)
+    acc_bin_0p5 = accuracy_score(all_bin_labels, all_bin_preds_0p5)
+    f1_bin_0p5 = f1_score(all_bin_labels, all_bin_preds_0p5)
+
+    all_bin_preds = (all_bin_probs >= thr_to_use).astype(np.int64)
     acc_bin = accuracy_score(all_bin_labels, all_bin_preds)
     f1_bin = f1_score(all_bin_labels, all_bin_preds)
 
-    f1_class_macro = f1_score(all_class_labels, all_class_preds, average="macro")
+    # Class F1
+    f1_class_macro_all = f1_score(all_class_labels, all_class_preds, average="macro")
+
+    if all_class_labels_pos.size > 0:
+        f1_class_macro_pos = f1_score(all_class_labels_pos, all_class_preds_pos, average="macro")
+    else:
+        f1_class_macro_pos = float("nan")
 
     metrics = {
-        "loss_total": avg_total_loss,
-        "loss_bin": avg_bin_loss,
-        "loss_class": avg_class_loss,
-        "auc_roc": auc_roc,
-        "auc_pr": auc_pr,
-        "acc_bin": acc_bin,
-        "f1_bin": f1_bin,
-        "f1_class_macro": f1_class_macro,
+        "loss_total": float(avg_total_loss),
+        "loss_bin": float(avg_bin_loss),
+        "loss_class_pos": float(avg_class_loss),
+        "auc_roc": float(auc_roc),
+        "auc_pr": float(auc_pr),
+        "acc_bin": float(acc_bin),
+        "f1_bin": float(f1_bin),
+        "acc_bin_at_0p5": float(acc_bin_0p5),
+        "f1_bin_at_0p5": float(f1_bin_0p5),
+        "threshold_used": float(thr_to_use),
+        "pred_pos_rate": float(all_bin_preds.mean()),
+        "f1_class_macro_all": float(f1_class_macro_all),
+        "f1_class_macro_pos": float(f1_class_macro_pos),
+        "n_samples": float(total_samples),
+        "n_pos": float(total_pos),
     }
+    if tune_threshold:
+        metrics["threshold_best_f1"] = float(best_thr)
+        metrics["f1_bin_best"] = float(f1_bin_best)
+
     return metrics
+
 
 
 # -------------------------
@@ -129,23 +211,33 @@ def train_one_epoch(
     data_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    *,
     lambda_class: float,
     lambda_ent: float,
     lambda_cont: float,
+    criterion_bin: Optional[nn.Module] = None,
+    criterion_class: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """
     One training epoch with attention regularisation.
+
+    Changes vs the original:
+      - Class loss is computed ONLY on positives (bin==1).
+      - BCE and CE can be weighted; pass criterion_bin / criterion_class from main to avoid per-epoch rebuild.
     """
     model.train()
 
-    criterion_bin = nn.BCEWithLogitsLoss()
-    criterion_class = nn.CrossEntropyLoss()
+    if criterion_bin is None:
+        criterion_bin = nn.BCEWithLogitsLoss()
+    if criterion_class is None:
+        criterion_class = nn.CrossEntropyLoss()
 
     total_loss = 0.0
     total_bin_loss = 0.0
     total_class_loss = 0.0
     total_attn_loss = 0.0
     total_samples = 0
+    total_pos = 0
 
     eps = 1e-8
 
@@ -157,59 +249,74 @@ def train_one_epoch(
         bin_labels = batch["bin_labels"].to(device, non_blocking=True)
         class_labels = batch["class_labels"].to(device, non_blocking=True)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         out = model(plm, di, conf, attn_mask, return_attn=True)
         logits_bin = out["logits_bin"]        # (B,)
         logits_class = out["logits_class"]    # (B, n_classes)
         attn_cls = out["attn_cls"]            # (B, L)
 
+        # Binary loss (all samples)
         loss_bin = criterion_bin(logits_bin, bin_labels)
-        loss_class = criterion_class(logits_class, class_labels)
 
-        # --- Attention regularisation ---
-        # attn_cls currently has weights (may not sum to 1 over residues);
-        # restrict to real tokens and renormalise.
+        # Class loss (positives only)
+        pos_mask = (bin_labels > 0.5)
+        if pos_mask.any():
+            loss_class = criterion_class(logits_class[pos_mask], class_labels[pos_mask])
+            total_pos += int(pos_mask.sum().item())
+        else:
+            loss_class = torch.tensor(0.0, device=device)
+
+        # Attention regularisation
         mask = attn_mask.float()              # (B, L)
         alpha = attn_cls * mask               # zero out pads
         alpha_sum = alpha.sum(dim=1, keepdim=True) + eps
         alpha = alpha / alpha_sum             # (B, L), per-sequence distribution
 
-        # Entropy term (encourage low entropy -> focused attention)
+        # Entropy term (encourage focused attention)
         ent = -(alpha * (alpha + eps).log()).sum(dim=1).mean()
         loss_ent = lambda_ent * ent
 
         # Continuity term (encourage local smoothness)
         diff = alpha[:, 1:] - alpha[:, :-1]
-        cont = (diff ** 2).sum(dim=1).mean()
+        # Only penalize diffs where both positions are real tokens (avoids real→pad boundary)
+        diff_mask = mask[:, 1:] * mask[:, :-1]             # (B, L-1), 1 for valid adjacent pairs
+        # Length-normalize per sequence (avoids longer sequences getting larger penalties)
+        cont_per_seq = ((diff ** 2) * diff_mask).sum(dim=1) / (diff_mask.sum(dim=1) + eps)  # (B,)
+        cont = cont_per_seq.mean()
         loss_cont = lambda_cont * cont
-
-        loss_attn = loss_ent + loss_cont
-
+        
+        # Total
         loss = loss_bin + lambda_class * loss_class + loss_attn
 
         B = bin_labels.size(0)
         total_samples += B
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Gradient clipping for stability
         optimizer.step()
 
-        total_loss += loss.item() * B
-        total_bin_loss += loss_bin.item() * B
-        total_class_loss += loss_class.item() * B
-        total_attn_loss += loss_attn.item() * B
+        total_loss += float(loss.item()) * B
+        total_bin_loss += float(loss_bin.item()) * B
+        if pos_mask.any():
+            total_class_loss += float(loss_class.item()) * float(pos_mask.sum().item())
+        
+        total_attn_loss += float(loss_attn.item()) * B
 
-    avg_loss = total_loss / total_samples
-    avg_bin_loss = total_bin_loss / total_samples
-    avg_class_loss = total_class_loss / total_samples
-    avg_attn_loss = total_attn_loss / total_samples
+    avg_loss = total_loss / max(total_samples, 1)
+    avg_bin_loss = total_bin_loss / max(total_samples, 1)
+    avg_class_loss_pos = (total_class_loss / total_pos) if total_pos > 0 else float("nan")
+    avg_attn_loss = total_attn_loss / max(total_samples, 1)
 
     return {
-        "loss_total": avg_loss,
-        "loss_bin": avg_bin_loss,
-        "loss_class": avg_class_loss,
-        "loss_attn": avg_attn_loss,
+        "loss_total": float(avg_loss),
+        "loss_bin": float(avg_bin_loss),
+        "loss_class_pos": float(avg_class_loss_pos),
+        "loss_attn": float(avg_attn_loss),
+        "n_samples": float(total_samples),
+        "n_pos": float(total_pos),
     }
+
 
 
 # -------------------------
@@ -246,12 +353,12 @@ def parse_args():
 
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--max_len", type=int, default=1024)
     p.add_argument("--lambda_class", type=float, default=0.5)
-    p.add_argument("--lambda_ent", type=float, default=0.01)
-    p.add_argument("--lambda_cont", type=float, default=0.01)
+    p.add_argument("--lambda_ent", type=float, default=0.001)
+    p.add_argument("--lambda_cont", type=float, default=0.001)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
@@ -315,6 +422,53 @@ def main():
     n_classes = len(class_to_idx)
     print(f"n_classes = {n_classes}")
     print(f"Train samples: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
+
+    # ------------------ Loss weighting (computed once; negligible overhead) ------------------
+    # Binary: BCE pos_weight = N_neg / N_pos (critical if imbalanced; ~1.0 if balanced).
+    train_bins = [int(r["bin"]) for r in train_ds.records]
+    n_train = len(train_bins)
+    n_pos = int(sum(train_bins))
+    n_neg = int(n_train - n_pos)
+    if n_pos > 0:
+        bce_pos_weight = float(n_neg / n_pos)
+    else:
+        bce_pos_weight = 1.0
+
+    # Class weights: inverse-frequency among POSITIVES only (since we train CE only on positives).
+    from collections import Counter
+    pos_class_counts = Counter()
+    for r in train_ds.records:
+        if int(r["bin"]) == 1:
+            pos_class_counts[r["class"]] += 1
+
+    class_weights = np.zeros(n_classes, dtype=np.float32)
+    for cls, idx_ in class_to_idx.items():
+        if cls == "non_ARG":
+            class_weights[idx_] = 0.0  # never used if Option A1 is enabled
+        else:
+            c = pos_class_counts.get(cls, 0)
+            class_weights[idx_] = (1.0 / c) if c > 0 else 0.0
+
+    # Normalize non-zero weights to mean 1 for stability
+    nz = class_weights > 0
+    if nz.any():
+        class_weights[nz] = class_weights[nz] / class_weights[nz].mean()
+
+    print(f"Train label stats: n={n_train} pos={n_pos} neg={n_neg} BCE pos_weight={bce_pos_weight:.4f}")
+    # Show a few positive-class counts to confirm distribution
+    if len(pos_class_counts) > 0:
+        print("Top positive classes:", pos_class_counts.most_common(5))
+
+    bce_pos_weight_t = torch.tensor([bce_pos_weight], device=device)
+    class_weights_t = torch.tensor(class_weights, device=device)
+
+    # Reuse loss objects across epochs (no per-epoch/per-batch rebuild)
+    criterion_bin_train = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight_t)
+    criterion_bin_eval = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight_t, reduction="sum")
+
+    criterion_class_train = nn.CrossEntropyLoss(weight=class_weights_t)
+    criterion_class_eval = nn.CrossEntropyLoss(weight=class_weights_t, reduction="sum")
+
 
     collate = lambda b: arg_collate_fn(b, l_max=args.max_len)
 
@@ -397,13 +551,15 @@ def main():
             lambda_class=args.lambda_class,
             lambda_ent=args.lambda_ent,
             lambda_cont=args.lambda_cont,
+            criterion_bin=criterion_bin_train,
+            criterion_class=criterion_class_train,
         )
 
         print(
             f"  Train: "
             f"loss={train_stats['loss_total']:.4f} "
             f"(bin={train_stats['loss_bin']:.4f}, "
-            f"class={train_stats['loss_class']:.4f}, "
+            f"class_pos={train_stats['loss_class_pos']:.4f}, "
             f"attn={train_stats['loss_attn']:.4f})"
         )
 
@@ -412,6 +568,9 @@ def main():
             val_loader,
             device,
             lambda_class=args.lambda_class,
+            tune_threshold=True,
+            criterion_bin=criterion_bin_eval,
+            criterion_class=criterion_class_eval,
         )
 
         # Step scheduler with validation AUROC
@@ -425,11 +584,14 @@ def main():
             f"  Val:   "
             f"loss={val_metrics['loss_total']:.4f} "
             f"(bin={val_metrics['loss_bin']:.4f}, "
-            f"class={val_metrics['loss_class']:.4f}) "
+            f"class_pos={val_metrics['loss_class_pos']:.4f}) "
             f"AUROC={val_metrics['auc_roc']:.4f} "
             f"AUPRC={val_metrics['auc_pr']:.4f} "
-            f"F1_bin={val_metrics['f1_bin']:.4f} "
-            f"F1_class_macro={val_metrics['f1_class_macro']:.4f}"
+            f"F1_bin@0.5={val_metrics['f1_bin_at_0p5']:.4f} "
+            f"F1_bin@thr={val_metrics['f1_bin']:.4f} "
+            f"thr={val_metrics['threshold_used']:.4f} "
+            f"pred_pos_rate={val_metrics['pred_pos_rate']:.4f} "
+            f"F1_class_macro_pos={val_metrics['f1_class_macro_pos']:.4f}"
         )
 
         # Checkpoint on best AUROC
@@ -466,16 +628,38 @@ def main():
     model.to(device)
     model.eval()
 
+
+    # 1) Select best threshold on VAL using the best checkpoint (do not use TEST for tuning).
+    val_metrics_best = evaluate(
+        model,
+        val_loader,
+        device,
+        lambda_class=args.lambda_class,
+        tune_threshold=True,
+        criterion_bin=criterion_bin_eval,
+        criterion_class=criterion_class_eval,
+    )
+    best_thr = float(val_metrics_best.get("threshold_best_f1", val_metrics_best["threshold_used"]))
+    print(f"Best VAL threshold for F1_bin: {best_thr:.4f} (VAL F1={val_metrics_best['f1_bin']:.4f})")
+
+    # 2) Evaluate TEST using that fixed threshold.
     test_metrics = evaluate(
         model,
         test_loader,
         device,
         lambda_class=args.lambda_class,
+        threshold=best_thr,
+        tune_threshold=False,
+        criterion_bin=criterion_bin_eval,
+        criterion_class=criterion_class_eval,
     )
 
     print("\nTest metrics:")
     for k, v in test_metrics.items():
-        print(f"  {k}: {v:.4f}")
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v}")
 
 
 if __name__ == "__main__":
