@@ -129,6 +129,57 @@ def _best_f1_threshold(labels: np.ndarray, probs: np.ndarray) -> Tuple[float, fl
         return 0.5, float(f1[best_i])
     return float(thr[best_i]), float(f1[best_i])
 
+def apply_rare_class_gate(
+    probs: np.ndarray,
+    gate_class_indices: Optional[Tuple[int, ...]] = None,
+    tau: float = 0.0,
+    delta: float = 0.0,
+) -> np.ndarray:
+    """Apply a simple confidence/margin gate for specified classes.
+
+    If the top-1 predicted class is in gate_class_indices, only accept it when:
+      - p(top1) >= tau  AND  (p(top1) - p(top2)) >= delta
+    Otherwise, fall back to the 2nd-best class.
+
+    This is evaluated on softmax probabilities and is meant to reduce false positives
+    for ultra-rare classes that are often overweighted during training.
+
+    Args:
+        probs: (N, C) softmax probabilities
+        gate_class_indices: tuple of class indices to gate (e.g. peptide, rifamycin)
+        tau: minimum probability for gated classes
+        delta: minimum margin p1 - p2 for gated classes
+
+    Returns:
+        preds: (N,) int64 adjusted predictions
+    """
+    if probs.size == 0:
+        return np.array([], dtype=np.int64)
+    if gate_class_indices is None or len(gate_class_indices) == 0:
+        return probs.argmax(axis=1).astype(np.int64)
+
+    gate_set = set(int(x) for x in gate_class_indices)
+
+    # Top-2 classes for each row
+    # argsort is fine here (C=16), simpler and stable.
+    top2 = np.argsort(probs, axis=1)[:, -2:]
+    pred2 = top2[:, 0]
+    pred1 = top2[:, 1]
+
+    p1 = probs[np.arange(probs.shape[0]), pred1]
+    p2 = probs[np.arange(probs.shape[0]), pred2]
+
+    mask = np.array([p in gate_set for p in pred1], dtype=bool)
+    if tau > 0:
+        mask &= (p1 < float(tau)) | ((p1 - p2) < float(delta))
+    else:
+        mask &= ((p1 - p2) < float(delta))
+
+    adj = pred1.copy()
+    adj[mask] = pred2[mask]
+    return adj.astype(np.int64)
+
+
 
 @dataclass
 class DataBundle:
@@ -151,11 +202,15 @@ def build_data(
     max_len: int = 1024,
     batch_size: int = 16,
     num_workers: int = 4,
+    class_weight_power: float = 1.0,
+    class_weight_cap: float = 1e9,
+    random_crop_train: bool = True,
 ) -> DataBundle:
-    """
-    Build datasets + loaders, and compute loss weights from TRAIN only.
-
-    Uses LMDB features if features_lmdb is provided; otherwise uses feature_dir.
+    """Build datasets + loaders, and compute loss weights from TRAIN only.
+    Features:
+      - Class weights can be tempered/capped: w=(1/c)^power, clipped at cap
+      - Training loader can use random cropping for long proteins
+      - Uses LMDB features if features_lmdb is provided; otherwise uses feature_dir.
     """
     # Build a validated, fixed class mapping (15 ARG + non_ARG)
     class_to_idx = build_fixed_class_mapping(train_tsv, val_tsv, test_tsv)
@@ -174,33 +229,49 @@ def build_data(
 
     n_classes = len(class_to_idx)
 
-    # ------------------ Loss weighting (computed once; negligible overhead) ------------------
+    # ------------------ Loss weighting (computed from TRAIN only) ------------------
     train_bins = [int(r["bin"]) for r in train_ds.records]
     n_train = len(train_bins)
     n_pos = int(sum(train_bins))
     n_neg = int(n_train - n_pos)
     bce_pos_weight = float(n_neg / n_pos) if n_pos > 0 else 1.0
 
-    # Class weights: inverse-frequency among POSITIVES only (since CE only on positives)
+    # Class weights: only among POSITIVES (since CE only on positives)
     from collections import Counter
     pos_class_counts = Counter()
     for r in train_ds.records:
         if int(r["bin"]) == 1:
             pos_class_counts[r["class"]] += 1
+    power = float(class_weight_power)
+    cap = float(class_weight_cap)
+
+    # Reference count anchors typical classes ~1.0 before normalization
+    counts = [pos_class_counts.get(cls, 0) for cls in class_to_idx.keys() if cls != NON_ARG_LABEL and pos_class_counts.get(cls, 0) > 0]
+    ref = float(np.median(counts)) if len(counts) > 0 else 1.0
+    if ref <= 0:
+        ref = 1.0
 
     class_weights = np.zeros(n_classes, dtype=np.float32)
     for cls, idx in class_to_idx.items():
-        if cls == "non_ARG":
+        if cls == NON_ARG_LABEL:
             class_weights[idx] = 0.0
-        else:
-            c = pos_class_counts.get(cls, 0)
-            class_weights[idx] = (1.0 / c) if c > 0 else 0.0
+            continue
+        c = int(pos_class_counts.get(cls, 0))
+        if c <= 0:
+            class_weights[idx] = 0.0
+            continue
+        w = (ref / float(c)) ** power
+        if cap > 0:
+            w = min(float(w), cap)
+        class_weights[idx] = float(w)
 
+    # Normalize non-zero weights to mean=1 (keeps loss scale stable)
     nz = class_weights > 0
     if nz.any():
         class_weights[nz] = class_weights[nz] / class_weights[nz].mean()
 
-    collate = lambda b: arg_collate_fn(b, l_max=max_len)
+    train_collate = lambda b: arg_collate_fn(b, l_max=max_len, random_crop=bool(random_crop_train))
+    eval_collate = lambda b: arg_collate_fn(b, l_max=max_len, random_crop=False)
 
     train_loader = DataLoader(
         train_ds,
@@ -208,7 +279,7 @@ def build_data(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=collate,
+        collate_fn=train_collate,
         drop_last=False,
     )
     val_loader = DataLoader(
@@ -217,7 +288,7 @@ def build_data(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=collate,
+        collate_fn=eval_collate,
         drop_last=False,
     )
     test_loader = DataLoader(
@@ -226,7 +297,7 @@ def build_data(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=collate,
+        collate_fn=eval_collate,
         drop_last=False,
     )
 
@@ -393,14 +464,16 @@ def evaluate_with_outputs(
     tune_threshold: bool = False,
     criterion_bin: nn.Module,
     criterion_class: nn.Module,
+    gate_class_indices: Optional[Tuple[int, ...]] = None,
+    gate_tau: float = 0.0,
+    gate_delta: float = 0.0,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
-    """
-    Evaluate and return:
+    """Evaluate and return:
       - metrics dict (bin + class macro_pos)
       - outputs dict (arrays) for per-class reporting
-
     Class metrics of interest for your stated end-goal:
       - f1_class_macro_pos computed only on true positives (bin==1).
+    Optional rare-class gating on class predictions.
     """
     model.eval()
 
@@ -433,7 +506,7 @@ def evaluate_with_outputs(
             logits_class = out["logits_class"]     # (B, n_classes)
 
             B = bin_labels.size(0)
-            total_samples += B
+            total_samples += int(B)
 
             # Losses
             bin_loss = criterion_bin(logits_bin, bin_labels)
@@ -445,20 +518,33 @@ def evaluate_with_outputs(
                 total_class_loss += float(class_loss.item())
                 total_pos += int(pos_mask.sum().item())
 
-                preds_class_pos = logits_class[pos_mask].argmax(dim=1)
                 probs_class_pos = torch.softmax(logits_class[pos_mask], dim=1)
+                probs_np = probs_class_pos.cpu().numpy()
+                preds_np = apply_rare_class_gate(
+                    probs_np,
+                    gate_class_indices=gate_class_indices,
+                    tau=float(gate_tau),
+                    delta=float(gate_delta),
+                )
 
                 pos_class_labels.append(class_labels[pos_mask].cpu().numpy())
-                pos_class_preds.append(preds_class_pos.cpu().numpy())
-                pos_class_probs.append(probs_class_pos.cpu().numpy())
+                pos_class_preds.append(preds_np)
+                pos_class_probs.append(probs_np)
 
             probs_bin = torch.sigmoid(logits_bin)
             all_bin_labels.append(bin_labels.cpu().numpy())
             all_bin_probs.append(probs_bin.cpu().numpy())
 
-            preds_class = logits_class.argmax(dim=1)
+            # All-sample class preds (for completeness)
+            probs_all = torch.softmax(logits_class, dim=1).cpu().numpy()
+            preds_all = apply_rare_class_gate(
+                probs_all,
+                gate_class_indices=gate_class_indices,
+                tau=float(gate_tau),
+                delta=float(gate_delta),
+            )
             all_class_labels.append(class_labels.cpu().numpy())
-            all_class_preds.append(preds_class.cpu().numpy())
+            all_class_preds.append(preds_all)
 
     all_bin_labels = np.concatenate(all_bin_labels, axis=0)
     all_bin_probs = np.concatenate(all_bin_probs, axis=0)
@@ -605,48 +691,82 @@ def save_reports(
     idx_to_class: Dict[int, str],
     prefix: str,
 ) -> None:
+    """Write per-class report + confusion matrix.
+
+    Always writes TSVs (stable, human-readable) and also writes JSON + NPY.
+    If pandas is available, also writes CSVs.
+
+    Files:
+      - {prefix}_{split_name}_class_report.json
+      - {prefix}_{split_name}_class_report.tsv
+      - {prefix}_{split_name}_class_report.csv (optional)
+      - {prefix}_{split_name}_confusion.npy
+      - {prefix}_{split_name}_confusion.tsv
+      - {prefix}_{split_name}_confusion.csv (optional)
+    """
     ensure_dir(out_dir)
 
-    # Add AUC columns per class into a tabular CSV
-    # Extract per-class entries (only integer keys in the report dict are class labels as strings)
     rows = []
     for k, v in report.items():
-        if k.isdigit():
+        if str(k).isdigit():
             c = int(k)
             row = dict(v)
             row["class_index"] = c
             row["class_name"] = idx_to_class.get(c, str(c))
-            row["roc_auc_ovr"] = float(roc_ovr[c]) if not np.isnan(roc_ovr[c]) else np.nan
-            row["pr_auc_ovr"] = float(pr_ovr[c]) if not np.isnan(pr_ovr[c]) else np.nan
+            row["roc_auc_ovr"] = float(roc_ovr[c]) if (c < len(roc_ovr) and not np.isnan(roc_ovr[c])) else np.nan
+            row["pr_auc_ovr"] = float(pr_ovr[c]) if (c < len(pr_ovr) and not np.isnan(pr_ovr[c])) else np.nan
+            if "f1-score" in row and "f1" not in row:
+                row["f1"] = row["f1-score"]
             rows.append(row)
 
-    # Write JSON report (full)
+    # Full JSON report
     with open(os.path.join(out_dir, f"{prefix}_{split_name}_class_report.json"), "w") as f:
         json.dump(report, f, indent=2)
 
-    # Write CSV (per-class only)
+    cols = ["class_index", "class_name", "precision", "recall", "f1", "support", "roc_auc_ovr", "pr_auc_ovr"]
+
+    # Always write TSV (no pandas required)
+    tsv_path = os.path.join(out_dir, f"{prefix}_{split_name}_class_report.tsv")
+    with open(tsv_path, "w") as f:
+        f.write("\t".join(cols) + "\n")
+        for r in sorted(rows, key=lambda x: x.get("class_index", 0)):
+            f.write(
+                f"{int(r.get('class_index',0))}\t{r.get('class_name','')}\t"
+                f"{float(r.get('precision',0.0)):.6f}\t{float(r.get('recall',0.0)):.6f}\t"
+                f"{float(r.get('f1', r.get('f1-score',0.0))):.6f}\t{int(r.get('support',0))}\t"
+                f"{r.get('roc_auc_ovr', float('nan'))}\t{r.get('pr_auc_ovr', float('nan'))}\n"
+            )
+
+    # Optional CSV
     try:
         import pandas as pd
-        df = pd.DataFrame(rows).sort_values(["support", "f1-score"], ascending=[False, False])
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            if "class_index" in df.columns:
+                df = df.sort_values(["class_index"], ascending=True)
+            for c in cols:
+                if c not in df.columns:
+                    df[c] = np.nan
+            df = df[cols]
         df.to_csv(os.path.join(out_dir, f"{prefix}_{split_name}_class_report.csv"), index=False)
     except Exception:
-        # Fallback: minimal TSV
-        tsv_path = os.path.join(out_dir, f"{prefix}_{split_name}_class_report.tsv")
-        with open(tsv_path, "w") as f:
-            f.write("class_index\tclass_name\tprecision\trecall\tf1\tsupport\troc_auc_ovr\tpr_auc_ovr\n")
-            for r in rows:
-                f.write(
-                    f"{r['class_index']}\t{r['class_name']}\t{r.get('precision',0):.6f}\t"
-                    f"{r.get('recall',0):.6f}\t{r.get('f1-score',0):.6f}\t{int(r.get('support',0))}\t"
-                    f"{r.get('roc_auc_ovr',np.nan)}\t{r.get('pr_auc_ovr',np.nan)}\n"
-                )
+        pass
 
-    # Save confusion matrix
+    # Confusion matrix
     np.save(os.path.join(out_dir, f"{prefix}_{split_name}_confusion.npy"), cm)
-    # Also write a labeled CSV for convenience
+
+    labels = [idx_to_class.get(i, str(i)) for i in range(cm.shape[0])]
+
+    # Always write TSV
+    cm_tsv = os.path.join(out_dir, f"{prefix}_{split_name}_confusion.tsv")
+    with open(cm_tsv, "w") as f:
+        f.write("true\\pred" + "\t" + "\t".join(labels) + "\n")
+        for i, lab in enumerate(labels):
+            f.write(lab + "\t" + "\t".join(str(int(x)) for x in cm[i]) + "\n")
+
+    # Optional CSV
     try:
         import pandas as pd
-        labels = [idx_to_class.get(i, str(i)) for i in range(cm.shape[0])]
         dfcm = pd.DataFrame(cm, index=labels, columns=labels)
         dfcm.to_csv(os.path.join(out_dir, f"{prefix}_{split_name}_confusion.csv"))
     except Exception:
@@ -763,18 +883,43 @@ def create_study_safe(args: argparse.Namespace, pruner, sampler):
         _release_dir_lock(lock_dir)
 
 def objective_factory(args: argparse.Namespace):
+    # Parse once (names -> indices happens per-trial after class mapping exists)
+    gate_names: List[str] = []
+    if getattr(args, "gate_classes", None):
+        gate_names = [c.strip() for c in str(args.gate_classes).split(',') if c.strip()]
+
     def objective(trial: "optuna.Trial") -> float:
-        # ---- Search space (keep high-ROI, end-goal aligned) ----
+        # ---- Search space (high-ROI, end-goal aligned) ----
         lr = trial.suggest_float("lr", 1e-5, 3e-4, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True)
         dropout = trial.suggest_float("dropout", 0.0, 0.30)
-        lambda_class = trial.suggest_float("lambda_class", 0.1, 1.0)
 
+        lambda_class = trial.suggest_float("lambda_class", 0.1, 1.0)
         lambda_ent = trial.suggest_float("lambda_ent", 1e-6, 1e-2, log=True)
         lambda_cont = trial.suggest_float("lambda_cont", 1e-6, 1e-2, log=True)
 
-        batch_size = trial.suggest_categorical("batch_size", [8, 16, 32])
-        max_len = trial.suggest_categorical("max_len", [512, 1024])
+        # New: class-weight tempering/capping (applies to CE weights)
+        class_weight_power = trial.suggest_float("class_weight_power", 0.3, 1.3)
+        class_weight_cap = trial.suggest_float("class_weight_cap", 2.0, 50.0, log=True)
+
+        # New: rare-class gate hyperparams (applied at evaluation time)
+        t_k = trial.suggest_float("t_k", 0.55, 0.99)
+        t_delta = trial.suggest_float("t_delta", 0.0, 0.35)
+
+        max_len = trial.suggest_categorical("max_len", [512, 1024, 2048])
+        #constant categorical space for batch_size (never changes across trials)
+        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16, 32, 64])
+
+        # prune impossible/unsafe combos early
+        max_allowed = 64
+        if int(max_len) >= 2048:
+            max_allowed = 16
+        elif int(max_len) >= 1024:
+            max_allowed = 32
+
+        if int(batch_size) > max_allowed:
+            trial.set_user_attr("pruned_reason", f"batch_size {batch_size} too large for max_len {max_len}")
+            raise optuna.exceptions.TrialPruned()
 
         lr_factor = trial.suggest_categorical("lr_factor", [0.3, 0.5, 0.7])
         lr_patience = trial.suggest_int("lr_patience", 2, 5)
@@ -785,24 +930,37 @@ def objective_factory(args: argparse.Namespace):
                 f"\n=== Trial {trial.number} start (CUDA_VISIBLE_DEVICES={visible}) ===\n"
                 f"  lr={lr:.2e} wd={weight_decay:.2e} dropout={dropout:.3f}\n"
                 f"  lambda_class={lambda_class:.3f} lambda_ent={lambda_ent:.2e} lambda_cont={lambda_cont:.2e}\n"
+                f"  class_weight_power={class_weight_power:.2f} class_weight_cap={class_weight_cap:.2f}\n"
+                f"  gate(t_k={t_k:.2f}, t_delta={t_delta:.2f}) gate_classes={','.join(gate_names) if gate_names else '(none)'}\n"
                 f"  batch_size={batch_size} max_len={max_len} lr_factor={lr_factor} lr_patience={lr_patience}",
                 flush=True,
             )
 
-        # ---- Build data (depends on batch_size / max_len) ----
+        # ---- Build data (depends on batch_size / max_len + class-weight params) ----
         data = build_data(
-            args.train_tsv, args.val_tsv, args.test_tsv,
+            args.train_tsv,
+            args.val_tsv,
+            args.test_tsv,
             feature_dir=args.feature_dir,
             features_lmdb=args.features_lmdb,
             max_len=int(max_len),
             batch_size=int(batch_size),
             num_workers=args.num_workers,
+            class_weight_power=float(class_weight_power),
+            class_weight_cap=float(class_weight_cap),
+            random_crop_train=bool(getattr(args, "random_crop_train", True)),
+        )
+
+        # Gate indices resolved per-trial after mapping exists
+        gate_idx_tuple: Tuple[int, ...] = tuple(
+            data.class_to_idx[c] for c in gate_names
+            if (c in data.class_to_idx and c != NON_ARG_LABEL)
         )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = build_model(data.n_classes, dropout=dropout, max_len=int(max_len), device=device)
 
-        # Losses (match train_amrFold.py)
+        # Losses
         bce_pos_weight_t = torch.tensor([data.bce_pos_weight], device=device)
         class_weights_t = torch.tensor(data.class_weights, device=device)
 
@@ -849,6 +1007,9 @@ def objective_factory(args: argparse.Namespace):
                     tune_threshold=False,
                     criterion_bin=criterion_bin_eval,
                     criterion_class=criterion_class_eval,
+                    gate_class_indices=gate_idx_tuple if len(gate_idx_tuple) else None,
+                    gate_tau=float(t_k),
+                    gate_delta=float(t_delta),
                 )
 
                 score = float(val_metrics[args.metric])
@@ -895,225 +1056,340 @@ def objective_factory(args: argparse.Namespace):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        # Print ONLY completed trials (few)
+        if getattr(args, "print_completed_trials", False):
+            print(
+                f"[trial {trial.number}] COMPLETE best_{args.metric}={best_score:.6f} "
+                f"(max_len={max_len}, bs={batch_size}, lr={lr:.2e}, wd={weight_decay:.2e})",
+                flush=True,
+            )
+
         return float(best_score)
 
     return objective
 
 
 def retrain_best(args: argparse.Namespace) -> None:
+    """Retrain the best Optuna trial.
+
+    New (2026-01):
+      - multi-seed retrain (keeps per-seed subdirectories, copies best to tag root)
+      - rare-class gate (t_k, t_delta) applied to predictions during eval
+      - tuned class weighting (class_weight_power, class_weight_cap)
+    """
+    import optuna
+
+    pruner = None
+    sampler = None
+
+    # Load existing study
     study = optuna.load_study(study_name=args.study_name, storage=args.storage)
-    best = study.best_trial
+    best_trial = study.best_trial
 
-    # Output directory
-    tag = args.retrain_tag or f"retrain_best_trial{best.number}"
-    out_dir = ensure_dir(os.path.join(args.out_dir, tag))
+    print("\nBest trial (from Optuna storage):", flush=True)
+    print(f"  number={best_trial.number}  value={best_trial.value}", flush=True)
+    print(f"  params={best_trial.params}", flush=True)
 
-    # Persist best params
-    with open(os.path.join(out_dir, "best_trial.json"), "w") as f:
-        json.dump(
-            {
-                "study_name": args.study_name,
-                "best_trial_number": best.number,
-                "best_value": best.value,
-                "metric": args.metric,
-                "params": best.params,
-            },
-            f,
-            indent=2,
-        )
+    hp = dict(best_trial.params)
 
-    # Apply best params
-    hp = best.params
-    lr = float(hp.get("lr", args.lr_default))
-    weight_decay = float(hp.get("weight_decay", args.weight_decay_default))
-    dropout = float(hp.get("dropout", args.dropout_default))
-    lambda_class = float(hp.get("lambda_class", args.lambda_class_default))
-    lambda_ent = float(hp.get("lambda_ent", args.lambda_ent_default))
-    lambda_cont = float(hp.get("lambda_cont", args.lambda_cont_default))
-    batch_size = int(hp.get("batch_size", args.batch_size_default))
-    max_len = int(hp.get("max_len", args.max_len_default))
-    lr_factor = float(hp.get("lr_factor", args.lr_factor_default))
-    lr_patience = int(hp.get("lr_patience", args.lr_patience_default))
+    # Hyperparams (fallbacks keep backward compatibility if DB is older)
+    lr = float(hp.get("lr", args.default_lr))
+    weight_decay = float(hp.get("weight_decay", args.default_weight_decay))
+    dropout = float(hp.get("dropout", args.default_dropout))
+    lambda_class = float(hp.get("lambda_class", args.default_lambda_class))
+    lambda_ent = float(hp.get("lambda_ent", args.default_lambda_ent))
+    lambda_cont = float(hp.get("lambda_cont", args.default_lambda_cont))
 
-    # Data + model
-    data = build_data(
-        args.train_tsv, args.val_tsv, args.test_tsv,
-        feature_dir=args.feature_dir,
-        features_lmdb=args.features_lmdb,
-        max_len=max_len,
-        batch_size=batch_size,
-        num_workers=args.num_workers,
-    )
+    batch_size = int(hp.get("batch_size", args.default_batch_size))
+    max_len = int(hp.get("max_len", args.default_max_len))
+
+    lr_factor = float(hp.get("lr_factor", args.default_lr_factor))
+    lr_patience = int(hp.get("lr_patience", args.default_lr_patience))
+
+    class_weight_power = float(hp.get("class_weight_power", args.default_class_weight_power))
+    class_weight_cap = float(hp.get("class_weight_cap", args.default_class_weight_cap))
+
+    t_k = float(hp.get("t_k", args.default_t_k))
+    t_delta = float(hp.get("t_delta", args.default_t_delta))
+
+    # Parse retrain seeds
+    seeds: list[int]
+    if args.retrain_seeds:
+        seeds = [int(s.strip()) for s in args.retrain_seeds.split(",") if s.strip()]
+    else:
+        seeds = [int(args.seed)]
+
+    out_root = os.path.join(args.out_dir, args.retrain_tag)
+    ensure_dir(out_root)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(data.n_classes, dropout=dropout, max_len=max_len, device=device)
 
-    idx_to_class = {v: k for k, v in data.class_to_idx.items()}
+    # Gate classes (names -> indices are resolved after building data)
+    gate_names = [s.strip() for s in (args.gate_classes or "").split(",") if s.strip()]
 
-    bce_pos_weight_t = torch.tensor([data.bce_pos_weight], device=device)
-    class_weights_t = torch.tensor(data.class_weights, device=device)
+    def _run_one_seed(seed: int) -> Dict[str, Any]:
+        set_seed(seed)
 
-    criterion_bin_train = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight_t)
-    criterion_bin_eval = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight_t, reduction="sum")
+        seed_dir = os.path.join(out_root, f"seed_{seed}")
+        ensure_dir(seed_dir)
 
-    criterion_class_train = nn.CrossEntropyLoss(weight=class_weights_t)
-    criterion_class_eval = nn.CrossEntropyLoss(weight=class_weights_t, reduction="sum")
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=lr_factor, patience=lr_patience)
-
-    # Retrain loop with early stopping on args.retrain_metric (defaults to args.metric)
-    metric_name = args.retrain_metric or args.metric
-    best_score = -1.0
-    epochs_no_improve = 0
-    best_state = None
-
-    history = []
-
-    for epoch in range(1, args.retrain_epochs + 1):
-        train_m = train_one_epoch(
-            model,
-            data.train_loader,
-            optimizer,
-            device,
-            lambda_class=lambda_class,
-            lambda_ent=lambda_ent,
-            lambda_cont=lambda_cont,
-            criterion_bin=criterion_bin_train,
-            criterion_class=criterion_class_train,
-            epoch_number=epoch,
-            log_batch_progress=args.log_batch_progress,
+        data = build_data(
+            args.train_tsv, args.val_tsv, args.test_tsv,
+            feature_dir=args.feature_dir,
+            features_lmdb=args.features_lmdb,
+            max_len=max_len,
+            batch_size=batch_size,
+            num_workers=args.num_workers,
+            class_weight_power=class_weight_power,
+            class_weight_cap=class_weight_cap,
+            random_crop_train=True,
         )
 
-        val_m, _ = evaluate_with_outputs(
+        gate_idx = tuple(
+            data.class_to_idx[n] for n in gate_names
+            if (n in data.class_to_idx and n != NON_ARG_LABEL)
+        )
+
+        model = build_model(data.n_classes, dropout=dropout, max_len=max_len, device=device)
+
+        bce_pos_weight_t = torch.tensor([data.bce_pos_weight], device=device)
+        class_weights_t = torch.tensor(data.class_weights, device=device)
+
+        criterion_bin_train = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight_t)
+        criterion_bin_eval = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight_t, reduction="sum")
+
+        criterion_class_train = nn.CrossEntropyLoss(weight=class_weights_t)
+        criterion_class_eval = nn.CrossEntropyLoss(weight=class_weights_t, reduction="sum")
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=float(lr_factor),
+            patience=int(lr_patience),
+        )
+
+        best_score = -1.0
+        best_epoch = 0
+        best_path = os.path.join(seed_dir, "best_checkpoint.pt")
+        epochs_no_improve = 0
+
+        history_rows = []
+
+        for epoch in range(1, args.retrain_epochs + 1):
+            train_stats = train_one_epoch(
+                model,
+                data.train_loader,
+                optimizer,
+                device,
+                lambda_class=lambda_class,
+                lambda_ent=lambda_ent,
+                lambda_cont=lambda_cont,
+                criterion_bin=criterion_bin_train,
+                criterion_class=criterion_class_train,
+                trial_number=None,
+                epoch_number=epoch,
+                log_batch_progress=args.log_batch_progress,
+            )
+
+            val_metrics, _ = evaluate_with_outputs(
+                model,
+                data.val_loader,
+                device,
+                lambda_class=lambda_class,
+                threshold=0.5,
+                tune_threshold=False,
+                criterion_bin=criterion_bin_eval,
+                criterion_class=criterion_class_eval,
+                gate_class_indices=gate_idx,
+                gate_tau=t_k,
+                gate_delta=t_delta,
+            )
+
+            score = float(val_metrics.get(args.retrain_metric, val_metrics.get(args.metric, float("nan"))))
+            scheduler.step(score)
+
+            lr_now = float(optimizer.param_groups[0]["lr"])
+            history_rows.append({
+                "epoch": epoch,
+                "lr": lr_now,
+                "train_loss_total": train_stats["loss_total"],
+                "train_loss_bin": train_stats["loss_bin"],
+                "train_loss_class_pos": train_stats["loss_class_pos"],
+                "val_loss_total": val_metrics["loss_total"],
+                "val_f1_class_macro_pos": val_metrics.get("f1_class_macro_pos", float("nan")),
+                "val_f1_bin": val_metrics.get("f1_bin", float("nan")),
+                "val_auc_roc": val_metrics.get("auc_roc", float("nan")),
+            })
+
+            if score > best_score + args.min_delta:
+                best_score = score
+                best_epoch = epoch
+                epochs_no_improve = 0
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "hp": hp,
+                    "seed": seed,
+                }, best_path)
+            else:
+                epochs_no_improve += 1
+
+            if epochs_no_improve >= args.retrain_patience:
+                break
+
+        # Write history TSV
+        try:
+            import pandas as pd
+            pd.DataFrame(history_rows).to_csv(os.path.join(seed_dir, "history.tsv"), sep="\t", index=False)
+        except Exception:
+            with open(os.path.join(seed_dir, "history.tsv"), "w") as f:
+                if history_rows:
+                    cols = list(history_rows[0].keys())
+                    f.write("\t".join(cols) + "\n")
+                    for r in history_rows:
+                        f.write("\t".join(str(r.get(c, "")) for c in cols) + "\n")
+
+        # Load best checkpoint and run final eval + reports
+        ckpt = torch.load(best_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+
+        val_metrics, val_out = evaluate_with_outputs(
             model,
             data.val_loader,
             device,
             lambda_class=lambda_class,
+            threshold=0.5,
+            tune_threshold=True,
+            criterion_bin=criterion_bin_eval,
+            criterion_class=criterion_class_eval,
+            gate_class_indices=gate_idx,
+            gate_tau=t_k,
+            gate_delta=t_delta,
+        )
+        test_metrics, test_out = evaluate_with_outputs(
+            model,
+            data.test_loader,
+            device,
+            lambda_class=lambda_class,
+            threshold=float(val_metrics.get("threshold_used", 0.5)),
             tune_threshold=False,
             criterion_bin=criterion_bin_eval,
             criterion_class=criterion_class_eval,
+            gate_class_indices=gate_idx,
+            gate_tau=t_k,
+            gate_delta=t_delta,
         )
 
-        score = float(val_m.get(metric_name, float("nan")))
-        scheduler.step(score)
+        with open(os.path.join(seed_dir, "val_metrics.json"), "w") as f:
+            json.dump(val_metrics, f, indent=2)
+        with open(os.path.join(seed_dir, "test_metrics.json"), "w") as f:
+            json.dump(test_metrics, f, indent=2)
 
-        row = {"epoch": epoch}
-        row.update({f"train_{k}": v for k, v in train_m.items()})
-        row.update({f"val_{k}": v for k, v in val_m.items()})
-        history.append(row)
+        idx_to_class = {i: c for c, i in data.class_to_idx.items()}
 
-        if score > best_score + args.min_delta:
-            best_score = score
-            epochs_no_improve = 0
-            best_state = {
-                "epoch": epoch,
-                "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-                "score": best_score,
-            }
-        else:
-            epochs_no_improve += 1
+        # Per-class reports for positives only
+        y_true_val = val_out["class_labels_pos"]
+        y_pred_val = val_out["class_preds_pos"]
+        y_prob_val = val_out["class_probs_pos"]
+        rep_val, cm_val, roc_val, pr_val = per_class_reports(y_true_val, y_pred_val, y_prob_val, data.n_classes)
+        save_reports(seed_dir, split_name="val", report=rep_val, cm=cm_val, roc_ovr=roc_val, pr_ovr=pr_val, idx_to_class=idx_to_class, prefix="pos")
 
-        if epochs_no_improve >= args.retrain_patience:
-            break
+        y_true_test = test_out["class_labels_pos"]
+        y_pred_test = test_out["class_preds_pos"]
+        y_prob_test = test_out["class_probs_pos"]
+        rep_test, cm_test, roc_test, pr_test = per_class_reports(y_true_test, y_pred_test, y_prob_test, data.n_classes)
+        save_reports(seed_dir, split_name="test", report=rep_test, cm=cm_test, roc_ovr=roc_test, pr_ovr=pr_test, idx_to_class=idx_to_class, prefix="pos")
 
-    # Save history
-    try:
-        import pandas as pd
-        pd.DataFrame(history).to_csv(os.path.join(out_dir, "history.csv"), index=False)
-    except Exception:
-        with open(os.path.join(out_dir, "history.json"), "w") as f:
-            json.dump(history, f, indent=2)
+        summary = {
+            "seed": seed,
+            "best_epoch": best_epoch,
+            "best_score": float(best_score),
+            "val_f1_class_macro_pos": float(val_metrics.get("f1_class_macro_pos", float("nan"))),
+            "test_f1_class_macro_pos": float(test_metrics.get("f1_class_macro_pos", float("nan"))),
+            "val_f1_bin": float(val_metrics.get("f1_bin", float("nan"))),
+            "test_f1_bin": float(test_metrics.get("f1_bin", float("nan"))),
+            "val_auc_roc": float(val_metrics.get("auc_roc", float("nan"))),
+            "test_auc_roc": float(test_metrics.get("auc_roc", float("nan"))),
+            "threshold_used": float(val_metrics.get("threshold_used", 0.5)),
+            "seed_dir": seed_dir,
+        }
+        return summary
 
-    if best_state is None:
-        raise SystemExit("Retrain did not produce a valid checkpoint (unexpected).")
+    # ------------------ Run all seeds ------------------
+    summaries = []
+    for s in seeds:
+        print(f"\n=== Retrain seed {s} ===", flush=True)
+        summaries.append(_run_one_seed(int(s)))
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    # Load best checkpoint
-    model.load_state_dict(best_state["model_state"], strict=True)
+    # Summary TSV
+    sum_tsv = os.path.join(out_root, "multiseed_summary.tsv")
+    cols = [
+        "seed", "best_epoch", "best_score",
+        "val_f1_class_macro_pos", "test_f1_class_macro_pos",
+        "val_f1_bin", "test_f1_bin",
+        "val_auc_roc", "test_auc_roc",
+        "threshold_used", "seed_dir",
+    ]
+    with open(sum_tsv, "w") as f:
+        f.write("\t".join(cols) + "\n")
+        for r in summaries:
+            f.write("\t".join(str(r.get(c, "")) for c in cols) + "\n")
 
-    # --- Evaluate VAL (tune threshold for bin for diagnostics), and TEST using that threshold ---
-    val_metrics, val_out = evaluate_with_outputs(
-        model,
-        data.val_loader,
-        device,
-        lambda_class=lambda_class,
-        tune_threshold=True,
-        criterion_bin=criterion_bin_eval,
-        criterion_class=criterion_class_eval,
-    )
-    best_thr = float(val_metrics.get("threshold_best_f1", 0.5))
+    # Pick best seed by validation metric
+    best_by = args.retrain_metric
+    best_summary = max(summaries, key=lambda d: float(d.get("val_f1_class_macro_pos", -1.0)))
+    best_seed = int(best_summary["seed"])
+    best_seed_dir = best_summary["seed_dir"]
 
-    test_metrics, test_out = evaluate_with_outputs(
-        model,
-        data.test_loader,
-        device,
-        lambda_class=lambda_class,
-        threshold=best_thr,
-        tune_threshold=False,
-        criterion_bin=criterion_bin_eval,
-        criterion_class=criterion_class_eval,
-    )
+    with open(os.path.join(out_root, "best_seed.txt"), "w") as f:
+        f.write(str(best_seed) + "\n")
 
-    with open(os.path.join(out_dir, "val_metrics.json"), "w") as f:
-        json.dump(val_metrics, f, indent=2)
-    with open(os.path.join(out_dir, "test_metrics.json"), "w") as f:
-        json.dump(test_metrics, f, indent=2)
+    # Copy best artifacts to root for backward compatibility
+    for fn in [
+        "best_checkpoint.pt",
+        "val_metrics.json",
+        "test_metrics.json",
+        "history.tsv",
+        "pos_val_class_report.tsv",
+        "pos_val_class_report.csv",
+        "pos_val_confusion.tsv",
+        "pos_val_confusion.csv",
+        "pos_val_confusion.npy",
+        "pos_test_class_report.tsv",
+        "pos_test_class_report.csv",
+        "pos_test_confusion.tsv",
+        "pos_test_confusion.csv",
+        "pos_test_confusion.npy",
+    ]:
+        src = os.path.join(best_seed_dir, fn)
+        dst = os.path.join(out_root, fn)
+        if os.path.exists(src):
+            try:
+                shutil.copy2(src, dst)
+            except Exception:
+                pass
 
-    # --- Per-class reports (POS subset: aligns with your end-goal) ---
-    for split_name, out in [("val", val_out), ("test", test_out)]:
-        y_true = out["class_labels_pos"]
-        y_pred = out["class_preds_pos"]
-        y_prob = out["class_probs_pos"]
-        report, cm, roc_ovr, pr_ovr = per_class_reports(y_true, y_pred, y_prob, n_classes=data.n_classes)
-        save_reports(
-            out_dir,
-            split_name=split_name,
-            report=report,
-            cm=cm,
-            roc_ovr=roc_ovr,
-            pr_ovr=pr_ovr,
-            idx_to_class=idx_to_class,
-            prefix="pos",
-        )
-
-    # Save checkpoint + metadata
-    ckpt = {
-        "model_state_dict": model.state_dict(),
-        "class_to_idx": data.class_to_idx,
-        "idx_to_class": idx_to_class,
-        "best_epoch": best_state["epoch"],
-        "best_score": best_state["score"],
-        "retrain_metric": metric_name,
-        "val_best_thr_f1_bin": best_thr,
-        "hparams": {
-            "lr": lr,
-            "weight_decay": weight_decay,
-            "dropout": dropout,
-            "lambda_class": lambda_class,
-            "lambda_ent": lambda_ent,
-            "lambda_cont": lambda_cont,
-            "batch_size": batch_size,
-            "max_len": max_len,
-            "lr_factor": lr_factor,
-            "lr_patience": lr_patience,
-        },
-    }
-    torch.save(ckpt, os.path.join(out_dir, "best_checkpoint.pt"))
-
-    # Console summary (short, but immediately useful)
     print("\nFinal retrain summary (end-goal aligned):", flush=True)
-    print(f"  Optimised metric: {metric_name}", flush=True)
-    print(f"  Best epoch: {best_state['epoch']}  best_score: {best_state['score']:.6f}", flush=True)
-    print(f"  VAL:  f1_class_macro_pos={val_metrics.get('f1_class_macro_pos', float('nan')):.4f}  "
-          f"f1_bin={val_metrics.get('f1_bin', float('nan')):.4f}  auc_roc={val_metrics.get('auc_roc', float('nan')):.4f}", flush=True)
-    print(f"  TEST: f1_class_macro_pos={test_metrics.get('f1_class_macro_pos', float('nan')):.4f}  "
-          f"f1_bin={test_metrics.get('f1_bin', float('nan')):.4f}  auc_roc={test_metrics.get('auc_roc', float('nan')):.4f}", flush=True)
-    print(f"  Reports written to: {out_dir}", flush=True)
+    print(f"  Optimised metric: {args.retrain_metric}", flush=True)
+    print(f"  Best seed: {best_seed}", flush=True)
+    print(f"  Best epoch: {best_summary['best_epoch']}  best_score: {best_summary['best_score']:.6f}", flush=True)
+    print(
+        f"  VAL:  f1_class_macro_pos={best_summary['val_f1_class_macro_pos']:.4f}  "
+        f"f1_bin={best_summary['val_f1_bin']:.4f}  auc_roc={best_summary['val_auc_roc']:.4f}",
+        flush=True,
+    )
+    print(
+        f"  TEST: f1_class_macro_pos={best_summary['test_f1_class_macro_pos']:.4f}  "
+        f"f1_bin={best_summary['test_f1_bin']:.4f}  auc_roc={best_summary['test_auc_roc']:.4f}",
+        flush=True,
+    )
+    print(f"  Reports written to: {out_root}", flush=True)
 
-
-# -------------------------
-# CLI
-# -------------------------
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -1155,49 +1431,84 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--retrain_patience", type=int, default=8)
     p.add_argument("--retrain_metric", default=None, help="Metric for retrain early stopping; default=--metric")
     p.add_argument("--retrain_tag", default=None, help="Subdir name under out_dir for retrain outputs")
+    p.add_argument(
+        "--retrain_seeds",
+        default=None,
+        help="Comma-separated seeds for multi-seed retrain (e.g. '1,2,3'). If unset: uses --seed only.",
+    )
+
+    # Rare-class gate (classes are fixed; thresholds tuned)
+    p.add_argument(
+        "--gate_classes",
+        default="peptide,rifamycin,sulfonamide",
+        help="Comma-separated class names to apply the rare-class gate to (e.g. 'peptide,rifamycin,sulfonamide').",
+    )
+
+    # Data augmentation
+    p.add_argument(
+        "--random_crop_train",
+        action="store_true",
+        default=True,
+        help="Enable random cropping for proteins longer than max_len during TRAIN (recommended).",
+    )
 
     # Defaults (used if a study has missing params)
-    p.add_argument("--lr_default", type=float, default=1e-4)
-    p.add_argument("--weight_decay_default", type=float, default=1e-4)
-    p.add_argument("--dropout_default", type=float, default=0.1)
-    p.add_argument("--lambda_class_default", type=float, default=0.5)
-    p.add_argument("--lambda_ent_default", type=float, default=1e-3)
-    p.add_argument("--lambda_cont_default", type=float, default=1e-3)
-    p.add_argument("--batch_size_default", type=int, default=16)
-    p.add_argument("--max_len_default", type=int, default=1024)
-    p.add_argument("--lr_factor_default", type=float, default=0.5)
-    p.add_argument("--lr_patience_default", type=int, default=3)
+    p.add_argument("--lr_default", dest="default_lr", type=float, default=1e-4)
+    p.add_argument("--weight_decay_default", dest="default_weight_decay", type=float, default=1e-4)
+    p.add_argument("--dropout_default", dest="default_dropout", type=float, default=0.1)
+    p.add_argument("--lambda_class_default", dest="default_lambda_class", type=float, default=0.5)
+    p.add_argument("--lambda_ent_default", dest="default_lambda_ent", type=float, default=1e-3)
+    p.add_argument("--lambda_cont_default", dest="default_lambda_cont", type=float, default=1e-3)
+    p.add_argument("--batch_size_default", dest="default_batch_size", type=int, default=16)
+    p.add_argument("--max_len_default", dest="default_max_len", type=int, default=1024)
+    p.add_argument("--lr_factor_default", dest="default_lr_factor", type=float, default=0.5)
+    p.add_argument("--lr_patience_default", dest="default_lr_patience", type=int, default=3)
 
+    p.add_argument("--class_weight_power_default", dest="default_class_weight_power", type=float, default=1.0)
+    p.add_argument("--class_weight_cap_default", dest="default_class_weight_cap", type=float, default=10.0)
+
+    p.add_argument("--t_k_default", dest="default_t_k", type=float, default=0.8)
+    p.add_argument("--t_delta_default", dest="default_t_delta", type=float, default=0.15)
 
     # Logging / verbosity
     p.add_argument(
-        '--optuna_verbosity',
-        choices=['debug','info','warning','error','critical'],
-        default='info',
-        help='Optuna internal logging level'
+        "--optuna_verbosity",
+        choices=["debug", "info", "warning", "error", "critical"],
+        default="info",
+        help="Optuna internal logging level",
     )
-    # By default, keep console output minimal (Optuna logs only). Enable these flags if needed.
-    p.add_argument('--print_trial_header', action='store_true', help='Print trial hyperparameters at the start of each trial')
-    p.add_argument('--print_epoch_summary', action='store_true', help='Print per-epoch train/val summaries inside each trial')
-    p.add_argument('--log_batch_progress', action='store_true', help='Print intra-epoch milestone batch logs (25/50/75%)')
 
-    return p.parse_args()
+    p.add_argument("--print_trial_header", action="store_true", help="Print trial hyperparameters at the start of each trial")
+    p.add_argument("--print_epoch_summary", action="store_true", help="Print per-epoch train/val summaries inside each trial")
+    p.add_argument("--log_batch_progress", action="store_true", help="Print intra-epoch milestone batch logs (25/50/75%)")
+    p.add_argument("--print_completed_trials", action="store_true", help="Print one line for each COMPLETE trial")
+
+    args = p.parse_args()
+
+    # Retrain metric defaults to tuning metric
+    if args.retrain_metric is None:
+        args.retrain_metric = args.metric
+
+    # Retrain tag defaults to 'retrain_best_<timestamp>' if not provided
+    if args.retrain_tag is None:
+        args.retrain_tag = f"retrain_best_{int(time.time())}"
+
+    return args
 
 
 def _set_optuna_verbosity(level: str) -> None:
     mapping = {
-        'debug': optuna.logging.DEBUG,
-        'info': optuna.logging.INFO,
-        'warning': optuna.logging.WARNING,
-        'error': optuna.logging.ERROR,
-        'critical': optuna.logging.CRITICAL,
+        "debug": optuna.logging.DEBUG,
+        "info": optuna.logging.INFO,
+        "warning": optuna.logging.WARNING,
+        "error": optuna.logging.ERROR,
+        "critical": optuna.logging.CRITICAL,
     }
     optuna.logging.set_verbosity(mapping.get(level, optuna.logging.INFO))
 
 
 def main() -> None:
     args = parse_args()
-    _set_optuna_verbosity(getattr(args, 'optuna_verbosity', 'info'))
     _set_optuna_verbosity(getattr(args, 'optuna_verbosity', 'info'))
     set_seed(args.seed)
     ensure_dir(args.out_dir)
@@ -1208,11 +1519,11 @@ def main() -> None:
 
     # Tuning mode
     if args.pruner == "median":
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3, interval_steps=1)
+        pruner = optuna.pruners.MedianPruner(n_startup_trials=15, n_warmup_steps=5, interval_steps=1) # Wait at least 15 trials before pruning and 5 epochs per trial
     else:
         pruner = optuna.pruners.NopPruner()
 
-    sampler = optuna.samplers.TPESampler(seed=args.seed)
+    sampler = optuna.samplers.TPESampler(seed=args.seed, constant_liar=True)
     study = create_study_safe(args, pruner=pruner, sampler=sampler)
 
     study.optimize(

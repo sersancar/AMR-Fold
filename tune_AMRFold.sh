@@ -12,6 +12,7 @@
 #SBATCH --mail-type=FAIL
 #SBATCH --mail-user=sergio.sanchezcarrillo@universityofgalway.ie
 
+# Exit on error, undefined variable, or pipe failure
 set -euo pipefail
 
 # -------------------------
@@ -138,7 +139,7 @@ trap cleanup EXIT INT TERM
 CKPT_PID="$!"
 
 # -------------------------
-# Option B: Stage TSVs + features.lmdb locally, retrying multiple locations.
+# Stage TSVs + features.lmdb locally, retrying multiple locations.
 #   IMPORTANT: features.lmdb is ~73G.
 #   Order: /localscratch -> $SLURM_TMPDIR -> /dev/shm -> /tmp
 #   (so if /tmp is too small, we will fall back to /dev/shm rather than BeeGFS)
@@ -206,6 +207,8 @@ stage_all_to_base () {
 
   echo "  SUCCESS: staged dataset on ${base}"
   echo "    DB_TRAIN=${DB_TRAIN}"
+  echo "    DB_VAL=${DB_VAL}"
+  echo "    DB_TEST=${DB_TEST}"
   echo "    FEATURES=${FEATURESLMDBDIR}"
   df -T "$base" | tail -1
   return 0
@@ -219,7 +222,7 @@ CANDIDATES=(
 )
 
 if [[ "${STAGE_DATA}" -eq 1 ]]; then
-  echo "Staging TSVs + features.lmdb locally (Option B)..."
+  echo "Staging TSVs + features.lmdb locally"
   STAGED=0
   for base in "${CANDIDATES[@]}"; do
     [[ -z "$base" ]] && continue
@@ -251,10 +254,16 @@ fi
 # Run config
 # -------------------------
 METRIC=f1_class_macro_pos
-TRIALS_TOTAL=80
+TRIALS_TOTAL=100
 TRIALS_PER_WORKER=$((TRIALS_TOTAL / 2))
 MAX_EPOCHS_PER_TRIAL=20
 NUM_WORKERS=6
+
+# Rare-class gate (classes are fixed; thresholds t_k and t_delta are tuned by Optuna)
+GATE_CLASSES="peptide,rifamycin,sulfonamide"
+
+# Multi-seed retrain (comma-separated). Best seed by VAL f1_class_macro_pos is selected.
+RETRAIN_SEEDS="1,2,3,4,5"
 
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 export PYTHONPATH="${CODEDIR}:${PYTHONPATH:-}"
@@ -293,6 +302,10 @@ CUDA_VISIBLE_DEVICES=0 python -u ${CODEDIR}/tune_amrFold.py \
   --num_workers ${NUM_WORKERS} \
   --metric ${METRIC} \
   --pruner median \
+  --gate_classes ${GATE_CLASSES} \
+  --random_crop_train \
+  --print_completed_trials \
+  --seed 1234 \
   --optuna_verbosity info \
   > ${WORKER0_OUT} 2> ${WORKER0_ERR} &
 
@@ -312,6 +325,10 @@ CUDA_VISIBLE_DEVICES=1 python -u ${CODEDIR}/tune_amrFold.py \
   --num_workers ${NUM_WORKERS} \
   --metric ${METRIC} \
   --pruner median \
+  --gate_classes ${GATE_CLASSES} \
+  --random_crop_train \
+  --print_completed_trials \
+  --seed 4321 \
   --optuna_verbosity info \
   > ${WORKER1_OUT} 2> ${WORKER1_ERR} &
 
@@ -347,11 +364,15 @@ CUDA_VISIBLE_DEVICES=0 python -u ${CODEDIR}/tune_amrFold.py \
   --retrain_epochs 40 \
   --retrain_patience 8 \
   --retrain_tag ${RETRAIN_TAG} \
+  --gate_classes ${GATE_CLASSES} \
+  --retrain_seeds ${RETRAIN_SEEDS} \
+  --random_crop_train \
   --optuna_verbosity info \
   > ${RETRAIN_OUT} 2> ${RETRAIN_ERR}
 
 backup_optuna_db || true
 cp -f "${OPTUNA_DB_PERSIST}" "${OUTPUTDIR}/${STUDY_NAME}_${JOBTAG}.db" || true
+echo "Saved Optuna DB: ${OPTUNA_DB_PERSIST} at ${OUTPUTDIR}/${STUDY_NAME}_${JOBTAG}.db"
 
 echo "Job finished: $(date)"
 echo "Retrain outputs: ${OUTPUTDIR}/${RETRAIN_TAG}"
