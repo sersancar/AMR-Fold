@@ -8,8 +8,8 @@ BASE_URL="https://huggingface.co/datasets/${USER}/${REPO}/resolve/main"
 echo "Downloading model weights and containers from Hugging Face (${USER}/${REPO})..."
 
 # Create target directories
-mkdir -p amrfold_nextflow/models/ProstT5
-mkdir -p amrfold_nextflow/containers
+mkdir -p models/ProstT5
+mkdir -p containers
 
 echo "-> ProstT5 model.safetensors"
 curl -L "${BASE_URL}/ProstT5/model.safetensors" \
