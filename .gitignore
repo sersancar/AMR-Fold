@@ -5,6 +5,7 @@ amrfold_nextflow/containers/*.sif
 amrfold_nextflow/models/*.pt
 amrfold_nextflow/models/**/*.pt
 amrfold_nextflow/models/*.safetensors
+amrfold_nextflow/models/**/*.safetensors
 
 *.log
 .DS_Store
