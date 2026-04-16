@@ -1,4 +1,0 @@
-amrfold_nextflow/models/*.pt filter=lfs diff=lfs merge=lfs -text
-amrfold_nextflow/models/**/*.pt filter=lfs diff=lfs merge=lfs -text
-amrfold_nextflow/models/*.safetensors filter=lfs diff=lfs merge=lfs -text
-amrfold_nextflow/models/**/*.safetensors filter=lfs diff=lfs merge=lfs -text
