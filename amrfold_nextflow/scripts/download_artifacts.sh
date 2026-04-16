@@ -9,7 +9,6 @@ echo "Downloading model weights and containers from Hugging Face (${USER}/${REPO
 
 # Create target directories
 mkdir -p amrfold_nextflow/models/ProstT5
-mkdir -p amrfold_nextflow/models/checkpoints
 mkdir -p amrfold_nextflow/containers
 
 echo "-> ProstT5 model.safetensors"
@@ -19,7 +18,7 @@ curl -L "${BASE_URL}/ProstT5/model.safetensors" \
 for SEED in 1 2 3 4 5; do
   echo "-> checkpoint seed ${SEED}"
   curl -L "${BASE_URL}/checkpoints/best_checkpoint_seed_${SEED}.pt" \
-    -o "amrfold_nextflow/models/checkpoints/best_checkpoint_seed_${SEED}.pt"
+    -o "amrfold_nextflow/models/best_checkpoint_seed_${SEED}.pt"
 done
 
 echo "-> amrfold_cpu.sif"
