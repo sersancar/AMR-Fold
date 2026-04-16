@@ -1,0 +1,28 @@
+name: amrfold_infer_gpu
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.10
+  - pytorch=2.5.1
+  - torchvision=0.20.1
+  - torchaudio=2.5.1
+  - pytorch-cuda=12.1
+  - python-lmdb=1.7.5
+  - numpy=2.2.6
+  - pandas=2.3.3
+  - pyyaml=6.0.3
+  - scikit-learn=1.7.2
+  - scipy=1.15.2
+  - tqdm=4.67.1
+  - sympy=1.13.1
+  - pip
+  - pip:
+      - transformers==4.46.3
+      - tokenizers==0.20.3
+      - sentencepiece==0.1.96
+      - huggingface-hub==0.36.0
+      - safetensors==0.7.0
+      - protobuf==3.20.3
