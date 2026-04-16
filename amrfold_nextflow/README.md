@@ -78,6 +78,17 @@ nextflow run main.nf -profile slurm_gpu \
   --local_files_only true
 ```
 
+## Large artifacts (models and containers)
+
+Large files are stored on the Hugging Face Hub dataset
+`sersancar/amr-fold-artifacts` and are **not** tracked in this repo.
+
+To download all required artifacts after cloning:
+
+```bash
+bash scripts/download_artifacts.sh
+```
+
 ## ProstT5 resolution order
 
 The pipeline resolves ProstT5 in this order:
