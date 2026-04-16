@@ -164,49 +164,61 @@ def arg_collate_fn(
     batch: List[Dict[str, Any]],
     l_max: int = 1024,
     pad_token_id: int = 20,  # 0..19 are real 3Di tokens, 20 is pad
+    random_crop: bool = False,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Collate function for variable-length proteins.
+    """Collate function for variable-length proteins.
+
+    Key behaviour:
+      - Pads each batch to the max length *within the batch*, capped at ``l_max``.
+      - If ``random_crop=True`` and a sequence is longer than the batch max length,
+        crops a random contiguous window (training-time augmentation).
 
     Returns dict with:
       plm:  (B, L, 1024)
       di:   (B, L)         int64
       conf: (B, L)
-      attention_mask: (B, L)  1 for real, 0 for pad
+      attention_mask: (B, L)  True for real, False for pad
       bin_labels: (B,)
       class_labels: (B,)
     """
 
     batch_size = len(batch)
-    lengths = [min(x["plm"].shape[0], l_max) for x in batch]
+    raw_lengths = [x["plm"].shape[0] for x in batch]
+    lengths = [min(L, l_max) for L in raw_lengths]
     max_len = max(lengths)
 
     d_plm = batch[0]["plm"].shape[1]  # 1024
 
     plm_batch = torch.zeros(batch_size, max_len, d_plm, dtype=torch.float32)
-    di_batch = torch.full(
-        (batch_size, max_len),
-        fill_value=pad_token_id,
-        dtype=torch.long,
-    )
+    di_batch = torch.full((batch_size, max_len), fill_value=pad_token_id, dtype=torch.long)
     conf_batch = torch.zeros(batch_size, max_len, dtype=torch.float32)
     attn_mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
 
     bin_labels = torch.zeros(batch_size, dtype=torch.float32)
     class_labels = torch.zeros(batch_size, dtype=torch.long)
 
+    # Random crop (only meaningful when raw length > max_len)
     for i, sample in enumerate(batch):
-        L = min(sample["plm"].shape[0], max_len)
+        L0 = sample["plm"].shape[0]
+        seg_len = min(L0, max_len)
 
-        plm_batch[i, :L] = sample["plm"][:L]
-        di_batch[i, :L] = sample["di"][:L]
-        conf_batch[i, :L] = sample["conf"][:L]
-        attn_mask[i, :L] = True  # real tokens
+        if random_crop and L0 > seg_len:
+            # inclusive range [0, L0-seg_len]
+            start = int(torch.randint(0, L0 - seg_len + 1, (1,)).item())
+        else:
+            start = 0
+        end = start + seg_len
+
+        plm_batch[i, :seg_len] = sample["plm"][start:end]
+        di_batch[i, :seg_len] = sample["di"][start:end]
+        conf_batch[i, :seg_len] = sample["conf"][start:end]
+        attn_mask[i, :seg_len] = True
 
         bin_labels[i] = sample["bin"]
         class_labels[i] = sample["class"]
 
     return {
+        "seq_ids": [sample["seq_id"] for sample in batch],
         "plm": plm_batch,
         "di": di_batch,
         "conf": conf_batch,
