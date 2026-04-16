@@ -64,4 +64,4 @@ AMR-Fold is **under active development**. Interfaces, directory structure, and t
 
 If you use the dataset, please cite the Zenodo record:
 
-- https://doi.org/10.5281/zenodo.18234017
+- https://doi.org/10.5281/zenodo.19604701
