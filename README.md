@@ -6,7 +6,7 @@ AMR-Fold is a supervised learning project to predict **antimicrobial resistance 
 
 The AMR-Fold dataset (including predefined splits) is hosted on Zenodo:
 
-- https://doi.org/10.5281/zenodo.18234017
+- https://doi.org/10.5281/zenodo.19604701
 
 ## Model architecture (high level)
 
