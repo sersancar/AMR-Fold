@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 
 amrfold_nextflow/containers/*.sif
+
 amrfold_nextflow/models/*.pt
 amrfold_nextflow/models/**/*.pt
 amrfold_nextflow/models/*.safetensors
