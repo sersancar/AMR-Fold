@@ -76,7 +76,7 @@ process EXTRACT_FEATURES {
     def prostDir = params.prostt5_dir ?: (file("${modelsBase}/ProstT5").exists() ? "${modelsBase}/ProstT5" : null)
     def prost = prostDir ? "--prostt5_dir ${prostDir}" : ""
     def localOnly = params.local_files_only ? '--local_files_only true' : '--local_files_only false'
-    def gpuWrap = (params.use_gpu_lock && params.device == 'cuda') ? "${projectDir}/bin/acquire_gpu.sh " : ""
+    def gpuWrap = (params.use_gpu_lock && params.device == 'cuda') ? "bash ${projectDir}/bin/acquire_gpu.sh " : ""
 
     """
     ${gpuWrap}python ${projectDir}/bin/extract_features_fasta.py \
@@ -109,7 +109,7 @@ process SCORE_LMDB {
     script:
     def outname = shard_fasta.simpleName + '.predictions.tsv'
     def ckpts = checkpoints.collect { it.getName() }.join(' ')
-    def gpuWrap = (params.use_gpu_lock && params.device == 'cuda') ? "${projectDir}/bin/acquire_gpu.sh " : ""
+    def gpuWrap = (params.use_gpu_lock && params.device == 'cuda') ? "bash ${projectDir}/bin/acquire_gpu.sh " : ""
 
     """
     ${gpuWrap}python ${projectDir}/bin/score_lmdb_ensemble.py \
