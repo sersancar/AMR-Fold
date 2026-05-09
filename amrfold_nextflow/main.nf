@@ -35,23 +35,6 @@ params.gpus                  = 1
 params.gpus_per_task         = 1
 params.use_gpu_lock          = false
 
-def input_path  = params.input ?: params.input_fasta
-def models_path = params.models_dir ?: params.model_dir
-
-if( !input_path )  error "Please provide --input or --input_fasta <proteins.faa[.gz]>"
-if( !models_path ) error "Please provide --models_dir or --model_dir <checkpoint directory>"
-
-def resolvedProstDir = params.prostt5_dir ?: (
-    file("${models_path}/ProstT5").exists() ? "${models_path}/ProstT5" : null
-)
-
-log.info "AMR-Fold input: ${input_path}"
-log.info "AMR-Fold models_dir: ${models_path}"
-if( resolvedProstDir ) {
-    log.info "Using local ProstT5 directory: ${resolvedProstDir}"
-} else {
-    log.info "Using ProstT5 from model name: Rostlab/ProstT5"
-}
 
 process SPLIT_FASTA {
     tag { input_fasta.simpleName }
@@ -76,6 +59,7 @@ process SPLIT_FASTA {
     """
 }
 
+
 process EXTRACT_FEATURES {
     tag { shard_fasta.simpleName }
     label 'extract'
@@ -88,9 +72,12 @@ process EXTRACT_FEATURES {
     tuple path(shard_fasta), path("${shard_fasta.simpleName}.lmdb")
 
     script:
-    def prost = resolvedProstDir ? "--prostt5_dir ${resolvedProstDir}" : ""
+    def modelsBase = params.models_dir ?: params.model_dir
+    def prostDir = params.prostt5_dir ?: (file("${modelsBase}/ProstT5").exists() ? "${modelsBase}/ProstT5" : null)
+    def prost = prostDir ? "--prostt5_dir ${prostDir}" : ""
     def localOnly = params.local_files_only ? '--local_files_only true' : '--local_files_only false'
     def gpuWrap = (params.use_gpu_lock && params.device == 'cuda') ? "${projectDir}/bin/acquire_gpu.sh " : ""
+
     """
     ${gpuWrap}python ${projectDir}/bin/extract_features_fasta.py \
       --input_fasta ${shard_fasta} \
@@ -105,6 +92,7 @@ process EXTRACT_FEATURES {
       ${prost}
     """
 }
+
 
 process SCORE_LMDB {
     tag { shard_fasta.simpleName }
@@ -122,6 +110,7 @@ process SCORE_LMDB {
     def outname = shard_fasta.simpleName + '.predictions.tsv'
     def ckpts = checkpoints.collect { it.getName() }.join(' ')
     def gpuWrap = (params.use_gpu_lock && params.device == 'cuda') ? "${projectDir}/bin/acquire_gpu.sh " : ""
+
     """
     ${gpuWrap}python ${projectDir}/bin/score_lmdb_ensemble.py \
       --input_fasta ${shard_fasta} \
@@ -138,6 +127,7 @@ process SCORE_LMDB {
     """
 }
 
+
 process MERGE_PREDICTIONS {
     tag 'merge'
     label 'light'
@@ -151,21 +141,50 @@ process MERGE_PREDICTIONS {
 
     script:
     def inputs = shard_tables.collect { it.getName() }.join(' ')
+
     """
     python ${projectDir}/bin/amrfold_merge_predictions.py \
       --output amrfold_predictions.tsv ${inputs}
     """
 }
 
+
 workflow {
+    def input_path  = params.input ?: params.input_fasta
+    def models_path = params.models_dir ?: params.model_dir
+
+    if( !input_path ) {
+        error "Please provide --input or --input_fasta <proteins.faa[.gz]>"
+    }
+
+    if( !models_path ) {
+        error "Please provide --models_dir or --model_dir <checkpoint directory>"
+    }
+
+    def resolvedProstDir = params.prostt5_dir ?: (
+        file("${models_path}/ProstT5").exists() ? "${models_path}/ProstT5" : null
+    )
+
+    log.info "AMR-Fold input: ${input_path}"
+    log.info "AMR-Fold models_dir: ${models_path}"
+
+    if( resolvedProstDir ) {
+        log.info "Using local ProstT5 directory: ${resolvedProstDir}"
+    }
+    else {
+        log.info "Using ProstT5 from model name: Rostlab/ProstT5"
+    }
+
     ch_input = Channel.fromPath(input_path, checkIfExists: true)
 
-    ch_ckpts = Channel.fromPath("${models_path}/best_checkpoint_seed_*.pt", checkIfExists: true)
-      .ifEmpty { error "No checkpoints found under ${models_path}" }
-      .collect()
+    ch_ckpts = Channel
+        .fromPath("${models_path}/best_checkpoint_seed_*.pt", checkIfExists: true)
+        .ifEmpty { error "No checkpoints found under ${models_path}" }
+        .collect()
 
     split_res = SPLIT_FASTA(ch_input)
     feat_res  = EXTRACT_FEATURES(split_res.shards.flatten())
     pred_res  = SCORE_LMDB(feat_res, ch_ckpts)
+
     MERGE_PREDICTIONS(pred_res.shard_predictions.collect())
 }
