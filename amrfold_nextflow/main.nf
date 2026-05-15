@@ -14,17 +14,21 @@ params.half_precision        = true
 params.prostt5_dir           = null
 params.local_files_only      = false
 
-params.extract_batch_size    = 8
-params.extract_token_budget  = 4096
+params.extract_batch_size    = 4
+params.extract_token_budget  = 16384
 params.extract_commit_every  = 100
 
-params.infer_batch_size      = 16
+params.infer_batch_size      = 4
 params.num_workers           = 0
 
 params.bin_threshold         = 0.39917078614234924
 params.gate_classes          = 'multidrug,others,sulfonamide,rifamycin,quinolone'
 params.gate_tau              = 0.7108869316825098
 params.gate_delta            = 0.10345399260721301
+
+params.dropout               = 0.1038155492514013
+params.max_len               = 1024
+params.class_loss_type       = 'bce'
 
 params.publish_intermediates = false
 
@@ -123,6 +127,9 @@ process SCORE_LMDB {
       --gate_classes ${params.gate_classes} \
       --gate_tau ${params.gate_tau} \
       --gate_delta ${params.gate_delta} \
+      --dropout ${params.dropout} \
+      --max_len ${params.max_len} \
+      --class_loss_type ${params.class_loss_type} \
       --checkpoints ${ckpts}
     """
 }
@@ -167,6 +174,15 @@ workflow {
 
     log.info "AMR-Fold input: ${input_path}"
     log.info "AMR-Fold models_dir: ${models_path}"
+    log.info "Inference batch size: ${params.infer_batch_size}"
+    log.info "Extraction batch size: ${params.extract_batch_size}"
+    log.info "Extraction token budget: ${params.extract_token_budget}"
+    log.info "Class loss type: ${params.class_loss_type}"
+    log.info "Max length: ${params.max_len}"
+    log.info "Dropout: ${params.dropout}"
+    log.info "Binary threshold: ${params.bin_threshold}"
+    log.info "Rare-class gate tau: ${params.gate_tau}"
+    log.info "Rare-class gate delta: ${params.gate_delta}"
 
     if( resolvedProstDir ) {
         log.info "Using local ProstT5 directory: ${resolvedProstDir}"
