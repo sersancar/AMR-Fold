@@ -52,7 +52,7 @@ Let `α ∈ R^L` be the [CLS]→residue attention distribution (averaged over he
 - **Binary head (ARG vs non-ARG)**:
   - `h_cls → Dropout → Linear(512→1)`; loss: `BCEWithLogitsLoss`
 - **Multiclass head (antibiotic class + non_ARG)**:
-  - `h_cls → Dropout → Linear(512→n_classes)`; loss: `CrossEntropyLoss`
+  - `h_cls → Dropout → Linear(512→n_classes)`; loss: `BCEWithLogitsLoss`
 - **Total loss**
   - `L_total = L_bin + λ · L_class + L_attn`, with `λ ≈ 0.5–1.0`
 
